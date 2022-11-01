@@ -107,6 +107,7 @@ pub enum Schema {
         doc: Documentation,
         fields: Vec<RecordField>,
         lookup: BTreeMap<String, usize>,
+        attributes: BTreeMap<String, Value>,
     },
     /// An `enum` Avro schema.
     Enum {
@@ -114,6 +115,7 @@ pub enum Schema {
         aliases: Aliases,
         doc: Documentation,
         symbols: Vec<String>,
+        attributes: BTreeMap<String, Value>,
     },
     /// A `fixed` Avro schema.
     Fixed {
@@ -121,6 +123,7 @@ pub enum Schema {
         aliases: Aliases,
         doc: Documentation,
         size: usize,
+        attributes: BTreeMap<String, Value>,
     },
     /// Logical type which represents `Decimal` values. The underlying type is serialized and
     /// deserialized as `Schema::Bytes` or `Schema::Fixed`.
@@ -237,7 +240,7 @@ pub struct Name {
 /// Represents documentation for complex Avro schemas.
 pub type Documentation = Option<String>;
 /// Represents the aliases for Named Schema
-pub type Aliases = Option<Vec<String>>;
+pub type Aliases = Option<Vec<Alias>>;
 /// Represents Schema lookup within a schema env
 pub(crate) type Names = HashMap<Name, Schema>;
 /// Represents Schema lookup within a schema
@@ -249,9 +252,9 @@ impl Name {
     /// Create a new `Name`.
     /// Parses the optional `namespace` from the `name` string.
     /// `aliases` will not be defined.
-    pub fn new(name: &str) -> AvroResult<Name> {
+    pub fn new(name: &str) -> AvroResult<Self> {
         let (name, namespace) = Name::get_name_and_namespace(name)?;
-        Ok(Name { name, namespace })
+        Ok(Self { name, namespace })
     }
 
     fn get_name_and_namespace(name: &str) -> AvroResult<(String, Namespace)> {
@@ -276,7 +279,7 @@ impl Name {
             _ => None,
         };
 
-        Ok(Name {
+        Ok(Self {
             name: type_name.unwrap_or(name),
             namespace: namespace_from_name.or_else(|| complex.string("namespace")),
         })
@@ -340,17 +343,59 @@ impl<'de> Deserialize<'de> for Name {
     where
         D: serde::de::Deserializer<'de>,
     {
-        serde_json::Value::deserialize(deserializer).and_then(|value| {
+        Value::deserialize(deserializer).and_then(|value| {
             use serde::de::Error;
             if let Value::Object(json) = value {
-                Name::parse(&json).map_err(D::Error::custom)
+                Name::parse(&json).map_err(Error::custom)
             } else {
-                Err(D::Error::custom(format!(
-                    "Expected a json object: {:?}",
+                Err(Error::custom(format!(
+                    "Expected a JSON object: {:?}",
                     value
                 )))
             }
         })
+    }
+}
+
+/// Newtype pattern for `Name` to better control the `serde_json::Value` representation.
+/// Aliases are serialized as an array of plain strings in the JSON representation.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct Alias(Name);
+
+impl Alias {
+    pub fn new(name: &str) -> AvroResult<Self> {
+        Name::new(name).map(Self)
+    }
+
+    pub fn name(&self) -> String {
+        self.0.name.clone()
+    }
+
+    pub fn namespace(&self) -> Namespace {
+        self.0.namespace.clone()
+    }
+
+    pub fn fullname(&self, default_namespace: Namespace) -> String {
+        self.0.fullname(default_namespace)
+    }
+
+    pub fn fully_qualified_name(&self, default_namespace: &Namespace) -> Name {
+        self.0.fully_qualified_name(default_namespace)
+    }
+}
+
+impl From<&str> for Alias {
+    fn from(name: &str) -> Self {
+        Alias::new(name).unwrap()
+    }
+}
+
+impl Serialize for Alias {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.fullname(None))
     }
 }
 
@@ -434,6 +479,86 @@ impl<'s> ResolvedSchema<'s> {
     }
 }
 
+pub(crate) struct ResolvedOwnedSchema {
+    names: Names,
+    root_schema: Schema,
+}
+
+impl TryFrom<Schema> for ResolvedOwnedSchema {
+    type Error = Error;
+
+    fn try_from(schema: Schema) -> AvroResult<Self> {
+        let names = HashMap::new();
+        let mut rs = ResolvedOwnedSchema {
+            names,
+            root_schema: schema,
+        };
+        Self::from_internal(&rs.root_schema, &mut rs.names, &None)?;
+        Ok(rs)
+    }
+}
+
+impl ResolvedOwnedSchema {
+    pub(crate) fn get_root_schema(&self) -> &Schema {
+        &self.root_schema
+    }
+    pub(crate) fn get_names(&self) -> &Names {
+        &self.names
+    }
+
+    fn from_internal(
+        schema: &Schema,
+        names: &mut Names,
+        enclosing_namespace: &Namespace,
+    ) -> AvroResult<()> {
+        match schema {
+            Schema::Array(schema) | Schema::Map(schema) => {
+                Self::from_internal(schema, names, enclosing_namespace)
+            }
+            Schema::Union(UnionSchema { schemas, .. }) => {
+                for schema in schemas {
+                    Self::from_internal(schema, names, enclosing_namespace)?
+                }
+                Ok(())
+            }
+            Schema::Enum { name, .. } | Schema::Fixed { name, .. } => {
+                let fully_qualified_name = name.fully_qualified_name(enclosing_namespace);
+                if names
+                    .insert(fully_qualified_name.clone(), schema.clone())
+                    .is_some()
+                {
+                    Err(Error::AmbiguousSchemaDefinition(fully_qualified_name))
+                } else {
+                    Ok(())
+                }
+            }
+            Schema::Record { name, fields, .. } => {
+                let fully_qualified_name = name.fully_qualified_name(enclosing_namespace);
+                if names
+                    .insert(fully_qualified_name.clone(), schema.clone())
+                    .is_some()
+                {
+                    Err(Error::AmbiguousSchemaDefinition(fully_qualified_name))
+                } else {
+                    let record_namespace = fully_qualified_name.namespace;
+                    for field in fields {
+                        Self::from_internal(&field.schema, names, &record_namespace)?
+                    }
+                    Ok(())
+                }
+            }
+            Schema::Ref { name } => {
+                let fully_qualified_name = name.fully_qualified_name(enclosing_namespace);
+                names
+                    .get(&fully_qualified_name)
+                    .map(|_| ())
+                    .ok_or(Error::SchemaResolutionError(fully_qualified_name))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 /// Represents a `field` in a `record` Avro schema.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RecordField {
@@ -453,10 +578,12 @@ pub struct RecordField {
     pub order: RecordFieldOrder,
     /// Position of the field in the list of `field` of its parent `Schema`
     pub position: usize,
+    /// A collection of all unknown fields in the record field.
+    pub custom_attributes: BTreeMap<String, Value>,
 }
 
 /// Represents any valid order for a `field` in a `record` Avro schema.
-#[derive(Clone, Debug, PartialEq, EnumString)]
+#[derive(Clone, Debug, Eq, PartialEq, EnumString)]
 #[strum(serialize_all = "kebab_case")]
 pub enum RecordFieldOrder {
     Ascending,
@@ -492,7 +619,28 @@ impl RecordField {
             schema,
             order,
             position,
+            custom_attributes: RecordField::get_field_custom_attributes(field),
         })
+    }
+
+    fn get_field_custom_attributes(field: &Map<String, Value>) -> BTreeMap<String, Value> {
+        let mut custom_attributes: BTreeMap<String, Value> = BTreeMap::new();
+        for (key, value) in field {
+            match key.as_str() {
+                "type" | "name" | "doc" | "default" | "order" | "position" => continue,
+                _ => custom_attributes.insert(key.clone(), value.clone()),
+            };
+            custom_attributes.insert(key.to_string(), value.clone());
+        }
+        custom_attributes
+    }
+
+    /// Returns true if this `RecordField` is nullable, meaning the schema is a `UnionSchema` where the first variant is `Null`.
+    pub fn is_nullable(&self) -> bool {
+        match self.schema {
+            Schema::Union(ref inner) => inner.is_nullable(),
+            _ => false,
+        }
     }
 }
 
@@ -507,7 +655,8 @@ pub struct UnionSchema {
 }
 
 impl UnionSchema {
-    pub(crate) fn new(schemas: Vec<Schema>) -> AvroResult<Self> {
+    /// Creates a new UnionSchema from a vector of schemas.
+    pub fn new(schemas: Vec<Schema>) -> AvroResult<Self> {
         let mut vindex = BTreeMap::new();
         for (i, schema) in schemas.iter().enumerate() {
             if let Schema::Union(_) = schema {
@@ -529,9 +678,9 @@ impl UnionSchema {
         &self.schemas
     }
 
-    /// Returns true if the first variant of this `UnionSchema` is `Null`.
+    /// Returns true if the any of the variants of this `UnionSchema` is `Null`.
     pub fn is_nullable(&self) -> bool {
-        !self.schemas.is_empty() && self.schemas[0] == Schema::Null
+        !self.schemas.is_empty() && self.schemas.iter().any(|s| s == &Schema::Null)
     }
 
     /// Optionally returns a reference to the schema matched by this value, as well as its position
@@ -543,10 +692,11 @@ impl UnionSchema {
             Some((i, &self.schemas[i]))
         } else {
             // slow path (required for matching logical or named types)
-            self.schemas
-                .iter()
-                .enumerate()
-                .find(|(_, schema)| value.validate(schema))
+            self.schemas.iter().enumerate().find(|(_, schema)| {
+                let rs =
+                    ResolvedSchema::try_from(*schema).expect("Schema didn't successfully parse");
+                value.validate_internal(schema, rs.get_names()).is_none()
+            })
         }
     }
 }
@@ -600,7 +750,7 @@ impl Schema {
     /// https://avro.apache.org/docs/1.8.2/spec.html#Parsing+Canonical+Form+for+Schemas
     pub fn canonical_form(&self) -> String {
         let json = serde_json::to_value(self)
-            .unwrap_or_else(|e| panic!("cannot parse Schema from JSON: {0}", e));
+            .unwrap_or_else(|e| panic!("Cannot parse Schema from JSON: {0}", e));
         parsing_canonical_form(&json)
     }
 
@@ -656,16 +806,26 @@ impl Schema {
         parser.parse_list()
     }
 
+    /// Parses an Avro schema from JSON.
     pub fn parse(value: &Value) -> AvroResult<Schema> {
         let mut parser = Parser::default();
         parser.parse(value, &None)
+    }
+
+    /// Returns the custom attributes (metadata) if the schema supports them.
+    pub fn custom_attributes(&self) -> Option<&BTreeMap<String, Value>> {
+        match self {
+            Schema::Record { attributes, .. }
+            | Schema::Enum { attributes, .. }
+            | Schema::Fixed { attributes, .. } => Some(attributes),
+            _ => None,
+        }
     }
 }
 
 impl Parser {
     /// Create a `Schema` from a string representing a JSON Avro schema.
     fn parse_str(&mut self, input: &str) -> Result<Schema, Error> {
-        // TODO: (#82) this should be a ParseSchemaError wrapping the JSON error
         let value = serde_json::from_str(input).map_err(Error::ParseSchemaJson)?;
         self.parse(&value, &None)
     }
@@ -706,7 +866,7 @@ impl Parser {
         match *value {
             Value::String(ref t) => self.parse_known_schema(t.as_str(), enclosing_namespace),
             Value::Object(ref data) => self.parse_complex(data, enclosing_namespace),
-            Value::Array(ref data) => self.parse_union(data, enclosing_namespace),
+            Value::Array(ref data) => self.parse_union(data, enclosing_namespace, None),
             _ => Err(Error::ParseSchemaFromValidJson),
         }
     }
@@ -788,16 +948,31 @@ impl Parser {
         ) -> Result<DecimalMetadata, Error> {
             match complex.get(key) {
                 Some(&Value::Number(ref value)) => parse_json_integer_for_decimal(value),
-                None => Err(Error::GetDecimalMetadataFromJson(key)),
-                Some(precision) => Err(Error::GetDecimalPrecisionFromJson {
+                None => {
+                    if key == "scale" {
+                        Ok(0)
+                    } else {
+                        Err(Error::GetDecimalMetadataFromJson(key))
+                    }
+                }
+                Some(value) => Err(Error::GetDecimalMetadataValueFromJson {
                     key: key.into(),
-                    precision: precision.clone(),
+                    value: value.clone(),
                 }),
             }
         }
         let precision = get_decimal_integer(complex, "precision")?;
         let scale = get_decimal_integer(complex, "scale")?;
-        Ok((precision, scale))
+
+        if precision < 1 {
+            return Err(Error::DecimalPrecisionMuBePositive { precision });
+        }
+
+        if precision < scale {
+            Err(Error::DecimalPrecisionLessThanScale { precision, scale })
+        } else {
+            Ok((precision, scale))
+        }
     }
 
     /// Parse a `serde_json::Value` representing a complex Avro type into a
@@ -973,7 +1148,10 @@ impl Parser {
                 other => self.parse_known_schema(other, enclosing_namespace),
             },
             Some(&Value::Object(ref data)) => self.parse_complex(data, enclosing_namespace),
-            Some(&Value::Array(ref variants)) => self.parse_union(variants, enclosing_namespace),
+            Some(&Value::Array(ref variants)) => {
+                let default = complex.get("default");
+                self.parse_union(variants, enclosing_namespace, default)
+            }
             Some(unknown) => Err(Error::GetComplexType(unknown.clone())),
             None => Err(Error::GetComplexTypeField),
         }
@@ -988,14 +1166,9 @@ impl Parser {
 
         if let Some(ref aliases) = aliases {
             aliases.iter().for_each(|alias| {
-                let alias_fullname = match namespace {
-                    Some(ref ns) => format!("{}.{}", ns, alias),
-                    None => alias.clone(),
-                };
-
-                let alias_name = Name::new(alias_fullname.as_str()).unwrap();
+                let alias_fullname = alias.fully_qualified_name(namespace);
                 self.resolving_schemas
-                    .insert(alias_name, resolving_schema.clone());
+                    .insert(alias_fullname, resolving_schema.clone());
             });
         }
     }
@@ -1016,13 +1189,9 @@ impl Parser {
 
         if let Some(ref aliases) = aliases {
             aliases.iter().for_each(|alias| {
-                let alias_fullname = match namespace {
-                    Some(ref ns) => format!("{}.{}", ns, alias),
-                    None => alias.clone(),
-                };
-                let alias_name = Name::new(alias_fullname.as_str()).unwrap();
-                self.resolving_schemas.remove(&alias_name);
-                self.parsed_schemas.insert(alias_name, schema.clone());
+                let alias_fullname = alias.fully_qualified_name(namespace);
+                self.resolving_schemas.remove(&alias_fullname);
+                self.parsed_schemas.insert(alias_fullname, schema.clone());
             });
         }
     }
@@ -1053,8 +1222,6 @@ impl Parser {
         complex: &Map<String, Value>,
         enclosing_namespace: &Namespace,
     ) -> AvroResult<Schema> {
-        let name = Name::parse(complex)?;
-        let aliases = complex.aliases();
         let fields_opt = complex.get("fields");
 
         if fields_opt.is_none() {
@@ -1062,6 +1229,9 @@ impl Parser {
                 return Ok(seen.clone());
             }
         }
+
+        let name = Name::parse(complex)?;
+        let aliases = fix_aliases_namespace(complex.aliases(), &name.namespace);
 
         let mut lookup = BTreeMap::new();
         let fully_qualified_name = name.fully_qualified_name(enclosing_namespace);
@@ -1091,10 +1261,27 @@ impl Parser {
             doc: complex.doc(),
             fields,
             lookup,
+            attributes: self.get_custom_attributes(complex, vec!["fields"]),
         };
 
         self.register_parsed_schema(&fully_qualified_name, &schema, &aliases);
         Ok(schema)
+    }
+
+    fn get_custom_attributes(
+        &self,
+        complex: &Map<String, Value>,
+        excluded: Vec<&'static str>,
+    ) -> BTreeMap<String, Value> {
+        let mut custom_attributes: BTreeMap<String, Value> = BTreeMap::new();
+        for (key, value) in complex {
+            match key.as_str() {
+                "type" | "name" | "namespace" | "doc" | "aliases" => continue,
+                candidate if excluded.contains(&candidate) => continue,
+                _ => custom_attributes.insert(key.clone(), value.clone()),
+            };
+        }
+        custom_attributes
     }
 
     /// Parse a `serde_json::Value` representing a Avro enum type into a
@@ -1104,9 +1291,6 @@ impl Parser {
         complex: &Map<String, Value>,
         enclosing_namespace: &Namespace,
     ) -> AvroResult<Schema> {
-        let name = Name::parse(complex)?;
-        let aliases = complex.aliases();
-        let fully_qualified_name = name.fully_qualified_name(enclosing_namespace);
         let symbols_opt = complex.get("symbols");
 
         if symbols_opt.is_none() {
@@ -1114,6 +1298,10 @@ impl Parser {
                 return Ok(seen.clone());
             }
         }
+
+        let name = Name::parse(complex)?;
+        let fully_qualified_name = name.fully_qualified_name(enclosing_namespace);
+        let aliases = fix_aliases_namespace(complex.aliases(), &name.namespace);
 
         let symbols: Vec<String> = symbols_opt
             .and_then(|v| v.as_array())
@@ -1146,6 +1334,7 @@ impl Parser {
             aliases: aliases.clone(),
             doc: complex.doc(),
             symbols,
+            attributes: self.get_custom_attributes(complex, vec!["symbols"]),
         };
 
         self.register_parsed_schema(&fully_qualified_name, &schema, &aliases);
@@ -1187,11 +1376,32 @@ impl Parser {
         &mut self,
         items: &[Value],
         enclosing_namespace: &Namespace,
+        default: Option<&Value>,
     ) -> AvroResult<Schema> {
         items
             .iter()
             .map(|v| self.parse(v, enclosing_namespace))
             .collect::<Result<Vec<_>, _>>()
+            .and_then(|schemas| {
+                if let Some(default_value) = default.cloned() {
+                    let avro_value = types::Value::from(default_value);
+                    let first_schema = schemas.first();
+                    if let Some(schema) = first_schema {
+                        // Try to resolve the schema
+                        let resolved_value = avro_value.to_owned().resolve(schema);
+                        match resolved_value {
+                            Ok(_) => {}
+                            Err(_) => {
+                                return Err(Error::GetDefaultUnion(
+                                    SchemaKind::from(schema),
+                                    types::ValueKind::from(avro_value),
+                                ));
+                            }
+                        }
+                    }
+                }
+                Ok(schemas)
+            })
             .and_then(|schemas| Ok(Schema::Union(UnionSchema::new(schemas)?)))
     }
 
@@ -1202,9 +1412,6 @@ impl Parser {
         complex: &Map<String, Value>,
         enclosing_namespace: &Namespace,
     ) -> AvroResult<Schema> {
-        let name = Name::parse(complex)?;
-        let fully_qualified_name = name.fully_qualified_name(enclosing_namespace);
-        let aliases = complex.aliases();
         let size_opt = complex.get("size");
         if size_opt.is_none() {
             if let Some(seen) = self.get_already_seen_schema(complex, enclosing_namespace) {
@@ -1221,17 +1428,46 @@ impl Parser {
             .and_then(|v| v.as_i64())
             .ok_or(Error::GetFixedSizeField)?;
 
+        let name = Name::parse(complex)?;
+        let fully_qualified_name = name.fully_qualified_name(enclosing_namespace);
+        let aliases = fix_aliases_namespace(complex.aliases(), &name.namespace);
+
         let schema = Schema::Fixed {
             name,
             aliases: aliases.clone(),
             doc,
             size: size as usize,
+            attributes: self.get_custom_attributes(complex, vec!["size"]),
         };
 
         self.register_parsed_schema(&fully_qualified_name, &schema, &aliases);
 
         Ok(schema)
     }
+}
+
+// A type alias may be specified either as a fully namespace-qualified, or relative
+// to the namespace of the name it is an alias for. For example, if a type named "a.b"
+// has aliases of "c" and "x.y", then the fully qualified names of its aliases are "a.c"
+// and "x.y".
+// https://avro.apache.org/docs/current/spec.html#Aliases
+fn fix_aliases_namespace(aliases: Option<Vec<String>>, namespace: &Namespace) -> Aliases {
+    aliases.map(|aliases| {
+        aliases
+            .iter()
+            .map(|alias| {
+                if alias.find('.').is_none() {
+                    match namespace {
+                        Some(ref ns) => format!("{}.{}", ns, alias),
+                        None => alias.clone(),
+                    }
+                } else {
+                    alias.clone()
+                }
+            })
+            .map(|alias| Alias::new(alias.as_str()).unwrap())
+            .collect()
+    })
 }
 
 fn get_schema_type_name(name: Name, value: Value) -> Name {
@@ -1304,6 +1540,7 @@ impl Serialize for Schema {
             Schema::Enum {
                 ref name,
                 ref symbols,
+                ref aliases,
                 ..
             } => {
                 let mut map = serializer.serialize_map(None)?;
@@ -1313,12 +1550,17 @@ impl Serialize for Schema {
                 }
                 map.serialize_entry("name", &name.name)?;
                 map.serialize_entry("symbols", symbols)?;
+
+                if let Some(ref aliases) = aliases {
+                    map.serialize_entry("aliases", aliases)?;
+                }
                 map.end()
             }
             Schema::Fixed {
                 ref name,
                 ref doc,
                 ref size,
+                ref aliases,
                 ..
             } => {
                 let mut map = serializer.serialize_map(None)?;
@@ -1331,6 +1573,10 @@ impl Serialize for Schema {
                     map.serialize_entry("doc", docstr)?;
                 }
                 map.serialize_entry("size", size)?;
+
+                if let Some(ref aliases) = aliases {
+                    map.serialize_entry("aliases", aliases)?;
+                }
                 map.end()
             }
             Schema::Decimal {
@@ -1391,6 +1637,7 @@ impl Serialize for Schema {
                     aliases: None,
                     doc: None,
                     size: 12,
+                    attributes: Default::default(),
                 };
                 map.serialize_entry("type", &inner)?;
                 map.serialize_entry("logicalType", "duration")?;
@@ -1419,11 +1666,11 @@ impl Serialize for RecordField {
 
 /// Parses a **valid** avro schema into the Parsing Canonical Form.
 /// https://avro.apache.org/docs/1.8.2/spec.html#Parsing+Canonical+Form+for+Schemas
-fn parsing_canonical_form(schema: &serde_json::Value) -> String {
+fn parsing_canonical_form(schema: &Value) -> String {
     match schema {
-        serde_json::Value::Object(map) => pcf_map(map),
-        serde_json::Value::String(s) => pcf_string(s),
-        serde_json::Value::Array(v) => pcf_array(v),
+        Value::Object(map) => pcf_map(map),
+        Value::String(s) => pcf_string(s),
+        Value::Array(v) => pcf_array(v),
         json => panic!(
             "got invalid JSON value for canonical form of schema: {0}",
             json
@@ -1431,7 +1678,7 @@ fn parsing_canonical_form(schema: &serde_json::Value) -> String {
     }
 }
 
-fn pcf_map(schema: &Map<String, serde_json::Value>) -> String {
+fn pcf_map(schema: &Map<String, Value>) -> String {
     // Look for the namespace variant up front.
     let ns = schema.get("namespace").and_then(|v| v.as_str());
     let mut fields = Vec::new();
@@ -1439,7 +1686,7 @@ fn pcf_map(schema: &Map<String, serde_json::Value>) -> String {
         // Reduce primitive types to their simple form. ([PRIMITIVE] rule)
         if schema.len() == 1 && k == "type" {
             // Invariant: function is only callable from a valid schema, so this is acceptable.
-            if let serde_json::Value::String(s) = v {
+            if let Value::String(s) = v {
                 return pcf_string(s);
             }
         }
@@ -1465,7 +1712,7 @@ fn pcf_map(schema: &Map<String, serde_json::Value>) -> String {
         }
 
         // Strip off quotes surrounding "size" type, if they exist ([INTEGERS] rule).
-        if k == "size" {
+        if k == "size" || k == "precision" || k == "scale" {
             let i = match v.as_str() {
                 Some(s) => s.parse::<i64>().expect("Only valid schemas are accepted!"),
                 None => v.as_i64().unwrap(),
@@ -1491,7 +1738,7 @@ fn pcf_map(schema: &Map<String, serde_json::Value>) -> String {
     format!("{{{}}}", inter)
 }
 
-fn pcf_array(arr: &[serde_json::Value]) -> String {
+fn pcf_array(arr: &[Value]) -> String {
     let inter = arr
         .iter()
         .map(parsing_canonical_form)
@@ -1511,12 +1758,14 @@ const RESERVED_FIELDS: &[&str] = &[
     "symbols",
     "items",
     "values",
-    "logicalType",
     "size",
+    "logicalType",
     "order",
     "doc",
     "aliases",
     "default",
+    "precision",
+    "scale",
 ];
 
 // Used to define the ordering and inclusion of fields.
@@ -1528,8 +1777,9 @@ fn field_ordering_position(field: &str) -> Option<usize> {
 }
 
 /// Trait for types that serve as an Avro data model. Derive implementation available
-/// through `derive` feature. Do not implement directly, implement [`derive::AvroSchemaComponent`]
-/// to get this trait through a blanket implementation.
+/// through `derive` feature. Do not implement directly!
+/// Implement `apache_avro::schema::derive::AvroSchemaComponent` to get this trait
+/// through a blanket implementation.
 pub trait AvroSchema {
     fn get_schema() -> Schema;
 }
@@ -1596,7 +1846,7 @@ pub mod derive {
         T: AvroSchemaComponent,
     {
         fn get_schema() -> Schema {
-            T::get_schema_in_ctxt(&mut HashMap::default(), &Option::None)
+            T::get_schema_in_ctxt(&mut HashMap::default(), &None)
         }
     }
 
@@ -1610,6 +1860,7 @@ pub mod derive {
         );
     );
 
+    impl_schema!(bool, Schema::Boolean);
     impl_schema!(i8, Schema::Int);
     impl_schema!(i16, Schema::Int);
     impl_schema!(i32, Schema::Int);
@@ -1728,6 +1979,8 @@ pub mod derive {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
+    use serde_json::json;
 
     #[test]
     fn test_invalid_schema() {
@@ -1797,6 +2050,45 @@ mod tests {
         assert_eq!(variants.next(), None);
     }
 
+    // AVRO-3621
+    #[test]
+    fn test_avro_3621_nullable_record_field() {
+        let nullable_record_field = RecordField {
+            name: "next".to_string(),
+            doc: None,
+            default: None,
+            schema: Schema::Union(
+                UnionSchema::new(vec![
+                    Schema::Null,
+                    Schema::Ref {
+                        name: Name {
+                            name: "LongList".to_owned(),
+                            namespace: None,
+                        },
+                    },
+                ])
+                .unwrap(),
+            ),
+            order: RecordFieldOrder::Ascending,
+            position: 1,
+            custom_attributes: Default::default(),
+        };
+
+        assert!(nullable_record_field.is_nullable());
+
+        let non_nullable_record_field = RecordField {
+            name: "next".to_string(),
+            doc: None,
+            default: Some(json!(2)),
+            schema: Schema::Long,
+            order: RecordFieldOrder::Ascending,
+            position: 1,
+            custom_attributes: Default::default(),
+        };
+
+        assert!(!non_nullable_record_field.is_nullable());
+    }
+
     // AVRO-3248
     #[test]
     fn test_union_of_records() {
@@ -1855,11 +2147,46 @@ mod tests {
                 ),
                 order: RecordFieldOrder::Ignore,
                 position: 0,
+                custom_attributes: Default::default(),
             }],
             lookup: BTreeMap::from_iter(vec![("field_one".to_string(), 0)]),
+            attributes: Default::default(),
         };
 
         assert_eq!(schema_c, schema_c_expected);
+    }
+
+    // AVRO-3584 : recursion in type definitions
+    #[test]
+    fn avro_3584_test_recursion_records() {
+        // A and B are the same except the name.
+        let schema_str_a = r#"{
+            "name": "A",
+            "type": "record",
+            "fields": [ {"name": "field_one", "type": "B"} ]
+        }"#;
+
+        let schema_str_b = r#"{
+            "name": "B",
+            "type": "record",
+            "fields": [ {"name": "field_one", "type": "A"} ]
+        }"#;
+
+        let list = Schema::parse_list(&[schema_str_a, schema_str_b]).unwrap();
+
+        let schema_a = list.first().unwrap().clone();
+
+        match schema_a {
+            Schema::Record { fields, .. } => {
+                let f1 = fields.get(0);
+
+                let ref_schema = Schema::Ref {
+                    name: Name::new("B").unwrap(),
+                };
+                assert_eq!(ref_schema, f1.unwrap().schema);
+            }
+            _ => panic!("Expected a record schema!"),
+        }
     }
 
     // AVRO-3248
@@ -1880,7 +2207,7 @@ mod tests {
             "name": "OptionA",
             "type": "record",
             "fields": [
-                {"name": "field_one",  "type": ["null", "A"], "default": "null"}
+                {"name": "field_one",  "type": ["null", "A"], "default": null}
             ]
         }"#;
 
@@ -1897,7 +2224,7 @@ mod tests {
             fields: vec![RecordField {
                 name: "field_one".to_string(),
                 doc: None,
-                default: Some(Value::String("null".to_string())),
+                default: Some(Value::Null),
                 schema: Schema::Union(
                     UnionSchema::new(vec![
                         Schema::Null,
@@ -1909,8 +2236,10 @@ mod tests {
                 ),
                 order: RecordFieldOrder::Ignore,
                 position: 0,
+                custom_attributes: Default::default(),
             }],
             lookup: BTreeMap::from_iter(vec![("field_one".to_string(), 0)]),
+            attributes: Default::default(),
         };
 
         assert_eq!(schema_option_a, schema_option_a_expected);
@@ -1948,6 +2277,7 @@ mod tests {
                     schema: Schema::Long,
                     order: RecordFieldOrder::Ascending,
                     position: 0,
+                    custom_attributes: Default::default(),
                 },
                 RecordField {
                     name: "b".to_string(),
@@ -1956,9 +2286,11 @@ mod tests {
                     schema: Schema::String,
                     order: RecordFieldOrder::Ascending,
                     position: 1,
+                    custom_attributes: Default::default(),
                 },
             ],
             lookup,
+            attributes: Default::default(),
         };
 
         assert_eq!(parsed, expected);
@@ -2015,6 +2347,7 @@ mod tests {
                             schema: Schema::String,
                             order: RecordFieldOrder::Ascending,
                             position: 0,
+                            custom_attributes: Default::default(),
                         },
                         RecordField {
                             name: "children".to_string(),
@@ -2025,14 +2358,18 @@ mod tests {
                             })),
                             order: RecordFieldOrder::Ascending,
                             position: 1,
+                            custom_attributes: Default::default(),
                         },
                     ],
                     lookup: node_lookup,
+                    attributes: Default::default(),
                 },
                 order: RecordFieldOrder::Ascending,
                 position: 0,
+                custom_attributes: Default::default(),
             }],
             lookup,
+            attributes: Default::default(),
         };
         assert_eq!(schema, expected);
 
@@ -2168,7 +2505,7 @@ mod tests {
                 name: "LongList".to_owned(),
                 namespace: None,
             },
-            aliases: Some(vec!["LinkedLongs".to_owned()]),
+            aliases: Some(vec![Alias::new("LinkedLongs").unwrap()]),
             doc: None,
             fields: vec![
                 RecordField {
@@ -2178,6 +2515,7 @@ mod tests {
                     schema: Schema::Long,
                     order: RecordFieldOrder::Ascending,
                     position: 0,
+                    custom_attributes: Default::default(),
                 },
                 RecordField {
                     name: "next".to_string(),
@@ -2197,9 +2535,11 @@ mod tests {
                     ),
                     order: RecordFieldOrder::Ascending,
                     position: 1,
+                    custom_attributes: Default::default(),
                 },
             ],
             lookup,
+            attributes: Default::default(),
         };
         assert_eq!(schema, expected);
 
@@ -2244,6 +2584,7 @@ mod tests {
                     schema: Schema::Long,
                     order: RecordFieldOrder::Ascending,
                     position: 0,
+                    custom_attributes: Default::default(),
                 },
                 RecordField {
                     name: "next".to_string(),
@@ -2257,9 +2598,11 @@ mod tests {
                     },
                     order: RecordFieldOrder::Ascending,
                     position: 1,
+                    custom_attributes: Default::default(),
                 },
             ],
             lookup,
+            attributes: Default::default(),
         };
         assert_eq!(schema, expected);
 
@@ -2313,9 +2656,11 @@ mod tests {
                         aliases: None,
                         doc: None,
                         symbols: vec!["one".to_string(), "two".to_string(), "three".to_string()],
+                        attributes: Default::default(),
                     },
                     order: RecordFieldOrder::Ascending,
                     position: 0,
+                    custom_attributes: Default::default(),
                 },
                 RecordField {
                     name: "next".to_string(),
@@ -2329,12 +2674,15 @@ mod tests {
                         aliases: None,
                         doc: None,
                         symbols: vec!["one".to_string(), "two".to_string(), "three".to_string()],
+                        attributes: Default::default(),
                     },
                     order: RecordFieldOrder::Ascending,
                     position: 1,
+                    custom_attributes: Default::default(),
                 },
             ],
             lookup,
+            attributes: Default::default(),
         };
         assert_eq!(schema, expected);
 
@@ -2388,9 +2736,11 @@ mod tests {
                         aliases: None,
                         doc: None,
                         size: 456,
+                        attributes: Default::default(),
                     },
                     order: RecordFieldOrder::Ascending,
                     position: 0,
+                    custom_attributes: Default::default(),
                 },
                 RecordField {
                     name: "next".to_string(),
@@ -2404,12 +2754,15 @@ mod tests {
                         aliases: None,
                         doc: None,
                         size: 456,
+                        attributes: Default::default(),
                     },
                     order: RecordFieldOrder::Ascending,
                     position: 1,
+                    custom_attributes: Default::default(),
                 },
             ],
             lookup,
+            attributes: Default::default(),
         };
         assert_eq!(schema, expected);
 
@@ -2434,6 +2787,7 @@ mod tests {
                 "clubs".to_owned(),
                 "hearts".to_owned(),
             ],
+            attributes: Default::default(),
         };
 
         assert_eq!(expected, schema);
@@ -2466,6 +2820,7 @@ mod tests {
             aliases: None,
             doc: None,
             size: 16usize,
+            attributes: Default::default(),
         };
 
         assert_eq!(expected, schema);
@@ -2483,6 +2838,7 @@ mod tests {
             aliases: None,
             doc: Some(String::from("FixedSchema documentation")),
             size: 16usize,
+            attributes: Default::default(),
         };
 
         assert_eq!(expected, schema);
@@ -3407,5 +3763,468 @@ mod tests {
         let schema_str = serde_json::to_string(&schema).expect("test failed");
         let _schema = Schema::parse_str(&schema_str).expect("test failed");
         assert_eq!(schema, _schema);
+    }
+
+    fn assert_avro_3512_aliases(aliases: &Aliases) {
+        match aliases {
+            Some(aliases) => {
+                assert_eq!(aliases.len(), 3);
+                assert_eq!(aliases[0], Alias::new("space.b").unwrap());
+                assert_eq!(aliases[1], Alias::new("x.y").unwrap());
+                assert_eq!(aliases[2], Alias::new(".c").unwrap());
+            }
+            None => {
+                panic!("'aliases' must be Some");
+            }
+        }
+    }
+
+    #[test]
+    fn avro_3512_alias_with_null_namespace_record() {
+        let schema = Schema::parse_str(
+            r#"
+            {
+              "type": "record",
+              "name": "a",
+              "namespace": "space",
+              "aliases": ["b", "x.y", ".c"],
+              "fields" : [
+                {"name": "time", "type": "long"}
+              ]
+            }
+        "#,
+        )
+        .unwrap();
+
+        if let Schema::Record { ref aliases, .. } = schema {
+            assert_avro_3512_aliases(aliases);
+        } else {
+            panic!("The Schema should be a record: {:?}", schema);
+        }
+    }
+
+    #[test]
+    fn avro_3512_alias_with_null_namespace_enum() {
+        let schema = Schema::parse_str(
+            r#"
+            {
+              "type": "enum",
+              "name": "a",
+              "namespace": "space",
+              "aliases": ["b", "x.y", ".c"],
+              "symbols" : [
+                "symbol1", "symbol2"
+              ]
+            }
+        "#,
+        )
+        .unwrap();
+
+        if let Schema::Enum { ref aliases, .. } = schema {
+            assert_avro_3512_aliases(aliases);
+        } else {
+            panic!("The Schema should be an enum: {:?}", schema);
+        }
+    }
+
+    #[test]
+    fn avro_3512_alias_with_null_namespace_fixed() {
+        let schema = Schema::parse_str(
+            r#"
+            {
+              "type": "fixed",
+              "name": "a",
+              "namespace": "space",
+              "aliases": ["b", "x.y", ".c"],
+              "size" : 12
+            }
+        "#,
+        )
+        .unwrap();
+
+        if let Schema::Fixed { ref aliases, .. } = schema {
+            assert_avro_3512_aliases(aliases);
+        } else {
+            panic!("The Schema should be a fixed: {:?}", schema);
+        }
+    }
+
+    #[test]
+    fn avro_3518_serialize_aliases_record() {
+        let schema = Schema::parse_str(
+            r#"
+            {
+              "type": "record",
+              "name": "a",
+              "namespace": "space",
+              "aliases": ["b", "x.y", ".c"],
+              "fields" : [
+                {"name": "time", "type": "long"}
+              ]
+            }
+        "#,
+        )
+        .unwrap();
+
+        let value = serde_json::to_value(&schema).unwrap();
+        let serialized = serde_json::to_string(&value).unwrap();
+        assert_eq!(
+            r#"{"aliases":["space.b","x.y","c"],"fields":[{"name":"time","type":"long"}],"name":"a","namespace":"space","type":"record"}"#,
+            &serialized
+        );
+        assert_eq!(schema, Schema::parse_str(&serialized).unwrap());
+    }
+
+    #[test]
+    fn avro_3518_serialize_aliases_enum() {
+        let schema = Schema::parse_str(
+            r#"
+            {
+              "type": "enum",
+              "name": "a",
+              "namespace": "space",
+              "aliases": ["b", "x.y", ".c"],
+              "symbols" : [
+                "symbol1", "symbol2"
+              ]
+            }
+        "#,
+        )
+        .unwrap();
+
+        let value = serde_json::to_value(&schema).unwrap();
+        let serialized = serde_json::to_string(&value).unwrap();
+        assert_eq!(
+            r#"{"aliases":["space.b","x.y","c"],"name":"a","namespace":"space","symbols":["symbol1","symbol2"],"type":"enum"}"#,
+            &serialized
+        );
+        assert_eq!(schema, Schema::parse_str(&serialized).unwrap());
+    }
+
+    #[test]
+    fn avro_3518_serialize_aliases_fixed() {
+        let schema = Schema::parse_str(
+            r#"
+            {
+              "type": "fixed",
+              "name": "a",
+              "namespace": "space",
+              "aliases": ["b", "x.y", ".c"],
+              "size" : 12
+            }
+        "#,
+        )
+        .unwrap();
+
+        let value = serde_json::to_value(&schema).unwrap();
+        let serialized = serde_json::to_string(&value).unwrap();
+        assert_eq!(
+            r#"{"aliases":["space.b","x.y","c"],"name":"a","namespace":"space","size":12,"type":"fixed"}"#,
+            &serialized
+        );
+        assert_eq!(schema, Schema::parse_str(&serialized).unwrap());
+    }
+
+    #[test]
+    fn avro_3130_parse_anonymous_union_type() {
+        let schema_str = r#"
+        {
+            "type": "record",
+            "name": "AccountEvent",
+            "fields": [
+                {"type":
+                  ["null",
+                   { "name": "accountList",
+                      "type": {
+                        "type": "array",
+                        "items": "long"
+                      }
+                  }
+                  ],
+                 "name":"NullableLongArray"
+               }
+            ]
+        }
+        "#;
+        let schema = Schema::parse_str(schema_str).unwrap();
+
+        if let Schema::Record { name, fields, .. } = schema {
+            assert_eq!(name, Name::new("AccountEvent").unwrap());
+
+            let field = &fields[0];
+            assert_eq!(&field.name, "NullableLongArray");
+
+            if let Schema::Union(ref union) = field.schema {
+                assert_eq!(union.schemas[0], Schema::Null);
+
+                if let Schema::Array(ref array_schema) = union.schemas[1] {
+                    if let Schema::Long = **array_schema {
+                        // OK
+                    } else {
+                        panic!("Expected a Schema::Array of type Long");
+                    }
+                } else {
+                    panic!("Expected Schema::Array");
+                }
+            } else {
+                panic!("Expected Schema::Union");
+            }
+        } else {
+            panic!("Expected Schema::Record");
+        }
+    }
+
+    #[test]
+    fn avro_custom_attributes_schema_without_attributes() {
+        let schemata_str = [
+            r#"
+            {
+                "type": "record",
+                "name": "Rec",
+                "doc": "A Record schema without custom attributes",
+                "fields": []
+            }
+            "#,
+            r#"
+            {
+                "type": "enum",
+                "name": "Enum",
+                "doc": "An Enum schema without custom attributes",
+                "symbols": []
+            }
+            "#,
+            r#"
+            {
+                "type": "fixed",
+                "name": "Fixed",
+                "doc": "A Fixed schema without custom attributes",
+                "size": 0
+            }
+            "#,
+        ];
+        for schema_str in schemata_str.iter() {
+            let schema = Schema::parse_str(schema_str).unwrap();
+            assert_eq!(schema.custom_attributes(), Some(&Default::default()));
+        }
+    }
+
+    const CUSTOM_ATTRS_SUFFIX: &str = r#"
+            "string_key": "value",
+            "number_key": 1.23,
+            "null_key": null,
+            "array_key": [1, 2, 3],
+            "object_key": {
+                "key": "value"
+            }
+        "#;
+
+    #[test]
+    fn avro_3609_custom_attributes_schema_with_attributes() {
+        let schemata_str = [
+            r#"
+            {
+                "type": "record",
+                "name": "Rec",
+                "namespace": "ns",
+                "doc": "A Record schema with custom attributes",
+                "fields": [],
+                {{{}}}
+            }
+            "#,
+            r#"
+            {
+                "type": "enum",
+                "name": "Enum",
+                "namespace": "ns",
+                "doc": "An Enum schema with custom attributes",
+                "symbols": [],
+                {{{}}}
+            }
+            "#,
+            r#"
+            {
+                "type": "fixed",
+                "name": "Fixed",
+                "namespace": "ns",
+                "doc": "A Fixed schema with custom attributes",
+                "size": 2,
+                {{{}}}
+            }
+            "#,
+        ];
+
+        for schema_str in schemata_str.iter() {
+            let schema = Schema::parse_str(
+                schema_str
+                    .to_owned()
+                    .replace("{{{}}}", CUSTOM_ATTRS_SUFFIX)
+                    .as_str(),
+            )
+            .unwrap();
+
+            assert_eq!(
+                schema.custom_attributes(),
+                Some(&expected_custom_attibutes())
+            );
+        }
+    }
+
+    fn expected_custom_attibutes() -> BTreeMap<String, Value> {
+        let mut expected_attibutes: BTreeMap<String, Value> = Default::default();
+        expected_attibutes.insert("string_key".to_string(), Value::String("value".to_string()));
+        expected_attibutes.insert("number_key".to_string(), json!(1.23));
+        expected_attibutes.insert("null_key".to_string(), Value::Null);
+        expected_attibutes.insert(
+            "array_key".to_string(),
+            Value::Array(vec![json!(1), json!(2), json!(3)]),
+        );
+        let mut object_value: HashMap<String, Value> = HashMap::new();
+        object_value.insert("key".to_string(), Value::String("value".to_string()));
+        expected_attibutes.insert("object_key".to_string(), json!(object_value));
+        expected_attibutes
+    }
+
+    #[test]
+    fn avro_3609_custom_attributes_record_field_without_attributes() {
+        let schema_str = String::from(
+            r#"
+            {
+                "type": "record",
+                "name": "Rec",
+                "doc": "A Record schema without custom attributes",
+                "fields": [
+                    {
+                        "name": "field_one",
+                        "type": "float",
+                        {{{}}}
+                    }
+                ]
+            }
+        "#,
+        );
+
+        let schema =
+            Schema::parse_str(schema_str.replace("{{{}}}", CUSTOM_ATTRS_SUFFIX).as_str()).unwrap();
+
+        match schema {
+            Schema::Record { name, fields, .. } => {
+                assert_eq!(name, Name::new("Rec").unwrap());
+                assert_eq!(fields.len(), 1);
+                let field = &fields[0];
+                assert_eq!(&field.name, "field_one");
+                assert_eq!(field.custom_attributes, expected_custom_attibutes());
+            }
+            _ => panic!("Expected Schema::Record"),
+        }
+    }
+
+    #[test]
+    fn avro_3625_null_is_first() {
+        let schema_str = String::from(
+            r#"
+            {
+                "type": "record",
+                "name": "union_schema_test",
+                "fields": [
+                    {"name": "a", "type": ["null", "long"], "default": null}
+                ]
+            }
+        "#,
+        );
+
+        let schema = Schema::parse_str(&schema_str).unwrap();
+
+        match schema {
+            Schema::Record { name, fields, .. } => {
+                assert_eq!(name, Name::new("union_schema_test").unwrap());
+                assert_eq!(fields.len(), 1);
+                let field = &fields[0];
+                assert_eq!(&field.name, "a");
+                assert_eq!(&field.default, &Some(Value::Null));
+                match &field.schema {
+                    Schema::Union(union) => {
+                        assert_eq!(union.variants().len(), 2);
+                        assert!(union.is_nullable());
+                        assert_eq!(union.variants()[0], Schema::Null);
+                        assert_eq!(union.variants()[1], Schema::Long);
+                    }
+                    _ => panic!("Expected Schema::Union"),
+                }
+            }
+            _ => panic!("Expected Schema::Record"),
+        }
+    }
+
+    #[test]
+    fn avro_3625_null_is_last() {
+        let schema_str = String::from(
+            r#"
+            {
+                "type": "record",
+                "name": "union_schema_test",
+                "fields": [
+                    {"name": "a", "type": ["long","null"], "default": 123}
+                ]
+            }
+        "#,
+        );
+
+        let schema = Schema::parse_str(&schema_str).unwrap();
+
+        match schema {
+            Schema::Record { name, fields, .. } => {
+                assert_eq!(name, Name::new("union_schema_test").unwrap());
+                assert_eq!(fields.len(), 1);
+                let field = &fields[0];
+                assert_eq!(&field.name, "a");
+                assert_eq!(&field.default, &Some(json!(123)));
+                match &field.schema {
+                    Schema::Union(union) => {
+                        assert_eq!(union.variants().len(), 2);
+                        assert_eq!(union.variants()[0], Schema::Long);
+                        assert_eq!(union.variants()[1], Schema::Null);
+                    }
+                    _ => panic!("Expected Schema::Union"),
+                }
+            }
+            _ => panic!("Expected Schema::Record"),
+        }
+    }
+
+    #[test]
+    fn avro_3625_null_is_the_middle() {
+        let schema_str = String::from(
+            r#"
+            {
+                "type": "record",
+                "name": "union_schema_test",
+                "fields": [
+                    {"name": "a", "type": ["long","null","int"], "default": 123}
+                ]
+            }
+        "#,
+        );
+
+        let schema = Schema::parse_str(&schema_str).unwrap();
+
+        match schema {
+            Schema::Record { name, fields, .. } => {
+                assert_eq!(name, Name::new("union_schema_test").unwrap());
+                assert_eq!(fields.len(), 1);
+                let field = &fields[0];
+                assert_eq!(&field.name, "a");
+                assert_eq!(&field.default, &Some(json!(123)));
+                match &field.schema {
+                    Schema::Union(union) => {
+                        assert_eq!(union.variants().len(), 3);
+                        assert_eq!(union.variants()[0], Schema::Long);
+                        assert_eq!(union.variants()[1], Schema::Null);
+                        assert_eq!(union.variants()[2], Schema::Int);
+                    }
+                    _ => panic!("Expected Schema::Union"),
+                }
+            }
+            _ => panic!("Expected Schema::Record"),
+        }
     }
 }

@@ -30,6 +30,12 @@ use syn::{
 struct FieldOptions {
     #[darling(default)]
     doc: Option<String>,
+    #[darling(default)]
+    default: Option<String>,
+    #[darling(default)]
+    rename: Option<String>,
+    #[darling(default)]
+    skip: Option<bool>,
 }
 
 #[derive(FromAttributes)]
@@ -86,12 +92,11 @@ fn derive_avro_schema(input: &mut DeriveInput) -> Result<TokenStream, Vec<syn::E
             )])
         }
     };
-
     let ident = &input.ident;
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
     Ok(quote! {
         impl #impl_generics apache_avro::schema::derive::AvroSchemaComponent for #ident #ty_generics #where_clause {
-            fn get_schema_in_ctxt(named_schemas: &mut HashMap<apache_avro::schema::Name, apache_avro::schema::Schema>, enclosing_namespace: &Option<String>) -> apache_avro::schema::Schema {
+            fn get_schema_in_ctxt(named_schemas: &mut std::collections::HashMap<apache_avro::schema::Name, apache_avro::schema::Schema>, enclosing_namespace: &Option<String>) -> apache_avro::schema::Schema {
                 let name =  apache_avro::schema::Name::new(#full_schema_name).expect(&format!("Unable to parse schema name {}", #full_schema_name)[..]).fully_qualified_name(enclosing_namespace);
                 let enclosing_namespace = &name.namespace;
                 if named_schemas.contains_key(&name) {
@@ -115,23 +120,47 @@ fn get_data_struct_schema_def(
     let mut record_field_exprs = vec![];
     match s.fields {
         syn::Fields::Named(ref a) => {
-            for (position, field) in a.named.iter().enumerate() {
-                let name = field.ident.as_ref().unwrap().to_string(); // we know everything has a name
-                let field_documented =
+            let mut index: usize = 0;
+            for field in a.named.iter() {
+                let mut name = field.ident.as_ref().unwrap().to_string(); // we know everything has a name
+                let field_attrs =
                     FieldOptions::from_attributes(&field.attrs[..]).map_err(darling_to_syn)?;
-                let doc = preserve_optional(field_documented.doc);
+                let doc = preserve_optional(field_attrs.doc);
+                if let Some(rename) = field_attrs.rename {
+                    name = rename
+                }
+                if let Some(true) = field_attrs.skip {
+                    continue;
+                }
+                let default_value = match field_attrs.default {
+                    Some(default_value) => {
+                        let _: serde_json::Value = serde_json::from_str(&default_value[..])
+                            .map_err(|e| {
+                                vec![Error::new(
+                                    field.ident.span(),
+                                    format!("Invalid avro default json: \n{}", e),
+                                )]
+                            })?;
+                        quote! {
+                            Some(serde_json::from_str(#default_value).expect(format!("Invalid JSON: {:?}", #default_value).as_str()))
+                        }
+                    }
+                    None => quote! { None },
+                };
                 let schema_expr = type_to_schema_expr(&field.ty)?;
-                let position = position;
+                let position = index;
                 record_field_exprs.push(quote! {
                     apache_avro::schema::RecordField {
                             name: #name.to_string(),
                             doc: #doc,
-                            default: Option::None,
+                            default: #default_value,
                             schema: #schema_expr,
                             order: apache_avro::schema::RecordFieldOrder::Ascending,
                             position: #position,
+                            custom_attributes: Default::default(),
                         }
                 });
+                index += 1;
             }
         }
         syn::Fields::Unnamed(_) => {
@@ -162,6 +191,7 @@ fn get_data_struct_schema_def(
             doc: #record_doc,
             fields: schema_fields,
             lookup,
+            attributes: Default::default(),
         }
     })
 }
@@ -186,7 +216,8 @@ fn get_data_enum_schema_def(
                 name: apache_avro::schema::Name::new(#full_schema_name).expect(&format!("Unable to parse enum name for schema {}", #full_schema_name)[..]),
                 aliases: #enum_aliases,
                 doc: #doc,
-                symbols: vec![#(#symbols.to_owned()),*]
+                symbols: vec![#(#symbols.to_owned()),*],
+                attributes: Default::default(),
             }
         })
     } else {
@@ -203,9 +234,9 @@ fn type_to_schema_expr(ty: &Type) -> Result<TokenStream, Vec<syn::Error>> {
         let type_string = p.path.segments.last().unwrap().ident.to_string();
 
         let schema = match &type_string[..] {
-            "bool" => quote! {Schema::Boolean},
+            "bool" => quote! {apache_avro::schema::Schema::Boolean},
             "i8" | "i16" | "i32" | "u8" | "u16" => quote! {apache_avro::schema::Schema::Int},
-            "i64" => quote! {apache_avro::schema::Schema::Long},
+            "u32" | "i64" => quote! {apache_avro::schema::Schema::Long},
             "f32" => quote! {apache_avro::schema::Schema::Float},
             "f64" => quote! {apache_avro::schema::Schema::Double},
             "String" | "str" => quote! {apache_avro::schema::Schema::String},

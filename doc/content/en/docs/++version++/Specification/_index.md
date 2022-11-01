@@ -3,6 +3,8 @@ title: "Specification"
 linkTitle: "Specification"
 weight: 4
 date: 2021-10-25
+aliases:
+- spec.html
 ---
 
 <!--
@@ -34,8 +36,8 @@ A Schema is represented in [JSON](https://www.json.org/) by one of:
 
 * A JSON string, naming a defined type.
 * A JSON object, of the form:
-```json
-{"type": "typeName" ...attributes...}
+```js
+{"type": "typeName", ...attributes...}
 ```
 where _typeName_ is either a primitive or derived type name, as defined below. Attributes not defined in this document are permitted as metadata, but must not affect the format of serialized data.
 * A JSON array, representing a union of embedded types.
@@ -95,7 +97,7 @@ Records use the type name "record" and support the following attributes:
   * _aliases_: a JSON array of strings, providing alternate names for this field (optional).
 
 For example, a linked-list of 64-bit values may be defined with:
-```json
+```jsonc
 {
   "type": "record",
   "name": "LongList",
@@ -179,9 +181,11 @@ For example, 16-byte quantity may be declared with:
 ```
 
 ### Names {#names}
-Record, enums and fixed are named types. Each has a fullname that is composed of two parts; a name and a namespace. Equality of names is defined on the fullname.
+Record, enums and fixed are named types. Each has a fullname that is composed of two parts; a name and a namespace, separated by a dot. Equality of names is defined on the fullname.
 
-The name portion of a fullname, record field names, and enum symbols must:
+Record fields and enum symbols have names as well (but no namespace). Equality of fields and enum symbols is defined on the name of the field/symbol within its scope (the record/enum that defines it). Fields and enum symbols across scopes are never equal.
+
+The name portion of the fullname of named types, record field names, and enum symbols must:
 
 * start with [A-Za-z_]
 * subsequently contain only [A-Za-z0-9_]
@@ -257,7 +261,7 @@ Complex types (`record`, `enum`, `array`, `map`, `fixed`) have no namespace, but
 A schema or protocol may not contain multiple definitions of a fullname. Further, a name must be defined before it is used ("before" in the depth-first, left-to-right traversal of the JSON parse tree, where the types attribute of a protocol is always deemed to come "before" the messages attribute.)
 
 ### Aliases
-Named types and fields may have aliases. An implementation may optionally use aliases to map a writer's schema to the reader's. This faciliates both schema evolution as well as processing disparate datasets.
+Named types and fields may have aliases. An implementation may optionally use aliases to map a writer's schema to the reader's. This facilitates both schema evolution as well as processing disparate datasets.
 
 Aliases function by re-writing the writer's schema using aliases from the reader's schema. For example, if the writer's schema was named "Foo" and the reader's schema is named "Bar" and has an alias of "Foo", then the implementation would act as though "Foo" were named "Bar" when reading. Similarly, if data was written as a record with a field named "x" and is read as a record with a field named "y" with alias "x", then the implementation would act as though "x" were named "y" when reading.
 
@@ -367,7 +371,7 @@ For example, the union schema `["null","string"]` would encode:
 
 * _null_ as zero (the index of "null" in the union):
 `00`
-* the string "a" as one (the index of "string" in the union, encoded as hex 02), followed by the serialized string:
+* the string "a" as one (the index of "string" in the union, 1, encoded as hex 02), followed by the serialized string:
 `02 02 61`
 NOTE: Currently for C/C++ implementations, the positions are practically an int, but theoretically a long. In reality, we don't expect unions with 215M members
 
@@ -560,7 +564,7 @@ A transport is a system that supports:
 
 * **transmission of request messages**
 * **receipt of corresponding response messages**
-Servers may send a response message back to the client corresponding to a request message. The mechanism of correspondance is transport-specific. For example, in HTTP it is implicit, since HTTP directly supports requests and responses. But a transport that multiplexes many client threads over a single socket would need to tag messages with unique identifiers.
+Servers may send a response message back to the client corresponding to a request message. The mechanism of correspondence is transport-specific. For example, in HTTP it is implicit, since HTTP directly supports requests and responses. But a transport that multiplexes many client threads over a single socket would need to tag messages with unique identifiers.
 
 Transports may be either stateless or stateful. In a stateless transport, messaging assumes no established connection state, while stateful transports establish connections that may be used for multiple messages. This distinction is discussed further in the [handshake](#handshake) section below.
 
@@ -806,27 +810,27 @@ A `time-millis` logical type annotates an Avro `int`, where the int stores the n
 ### Time (microsecond precision)
 The `time-micros` logical type represents a time of day, with no reference to a particular calendar, time zone or date, with a precision of one microsecond.
 
-A `time-micros` logical type annotates an Avro long, where the long stores the number of microseconds after midnight, 00:00:00.000000.
+A `time-micros` logical type annotates an Avro `long`, where the long stores the number of microseconds after midnight, 00:00:00.000000.
 
 ### Timestamp (millisecond precision)
 The `timestamp-millis` logical type represents an instant on the global timeline, independent of a particular time zone or calendar, with a precision of one millisecond. Please note that time zone information gets lost in this process. Upon reading a value back, we can only reconstruct the instant, but not the original representation. In practice, such timestamps are typically displayed to users in their local time zones, therefore they may be displayed differently depending on the execution environment.
 
-A `timestamp-millis` logical type annotates an Avro long, where the long stores the number of milliseconds from the unix epoch, 1 January 1970 00:00:00.000 UTC.
+A `timestamp-millis` logical type annotates an Avro `long`, where the long stores the number of milliseconds from the unix epoch, 1 January 1970 00:00:00.000 UTC.
 
 ### Timestamp (microsecond precision)
 The `timestamp-micros` logical type represents an instant on the global timeline, independent of a particular time zone or calendar, with a precision of one microsecond. Please note that time zone information gets lost in this process. Upon reading a value back, we can only reconstruct the instant, but not the original representation. In practice, such timestamps are typically displayed to users in their local time zones, therefore they may be displayed differently depending on the execution environment.
 
-A `timestamp-micros` logical type annotates an Avro long, where the long stores the number of microseconds from the unix epoch, 1 January 1970 00:00:00.000000 UTC.
+A `timestamp-micros` logical type annotates an Avro `long`, where the long stores the number of microseconds from the unix epoch, 1 January 1970 00:00:00.000000 UTC.
 
 ### Local timestamp (millisecond precision)
 The `local-timestamp-millis` logical type represents a timestamp in a local timezone, regardless of what specific time zone is considered local, with a precision of one millisecond.
 
-A `local-timestamp-millis` logical type annotates an Avro long, where the long stores the number of milliseconds, from 1 January 1970 00:00:00.000.
+A `local-timestamp-millis` logical type annotates an Avro `long`, where the long stores the number of milliseconds, from 1 January 1970 00:00:00.000.
 
 ### Local timestamp (microsecond precision)
 The `local-timestamp-micros` logical type represents a timestamp in a local timezone, regardless of what specific time zone is considered local, with a precision of one microsecond.
 
-A `local-timestamp-micros` logical type annotates an Avro long, where the long stores the number of microseconds, from 1 January 1970 00:00:00.000000.
+A `local-timestamp-micros` logical type annotates an Avro `long`, where the long stores the number of microseconds, from 1 January 1970 00:00:00.000000.
 
 ### Duration
 The `duration` logical type represents an amount of time defined by a number of months, days and milliseconds. This is not equivalent to a number of milliseconds, because, depending on the moment in time from which the duration is measured, the number of days in the month and number of milliseconds in a day may differ. Other standard periods such as years, quarters, hours and minutes can be expressed through these basic periods.

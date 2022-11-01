@@ -47,6 +47,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
@@ -191,7 +192,7 @@ public class SpecificData extends GenericData {
 
   /**
    * Retrieve the current value of the custom-coders feature flag. Defaults to
-   * <code>true</code>, but this default can be overridden using the system
+   * <code>false</code>, but this default can be overridden using the system
    * property <code>org.apache.avro.specific.use_custom_coders</code>, and can be
    * set dynamically by {@link SpecificData#useCustomCoders()}. See <a
    * href="https://avro.apache.org/docs/current/gettingstartedjava.html#Beta+feature:+Generating+faster+code"Getting
@@ -384,6 +385,8 @@ public class SpecificData extends GenericData {
         if (!(key instanceof Class && CharSequence.class.isAssignableFrom((Class<?>) key)))
           throw new AvroTypeException("Map key class not CharSequence: " + SchemaUtil.describe(key));
         return Schema.createMap(createSchema(value, names));
+      } else if (Optional.class.isAssignableFrom(raw)) {
+        return Schema.createUnion(Schema.create(Schema.Type.NULL), createSchema(params[0], names));
       } else {
         return createSchema(raw, names);
       }

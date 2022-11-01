@@ -1,8 +1,7 @@
 ---
-title: "C# API"
-linkTitle: "C# API"
-weight: 103
-manualLink: next/api/csharp/html/
+title: "New PMC member: Martin Grigorov"
+linkTitle: "New PMC member: Martin Grigorov"
+date: 2022-09-13
 ---
 
 <!--
@@ -26,4 +25,6 @@ manualLink: next/api/csharp/html/
 
 -->
 
-The C# API documentation can be found <a href="next/api/csharp/html/">here</a>.
+The Project Management Committee (PMC) for Apache Avro is pleased to announce that Martin Grigorov has accepted our invitation to become a PMC member.  He has has been active, reliable and responsive to the community and a solid contributor to various SDKs, bringing well-thought out reviews and comments to both old and new PRs and JIRA.  He definitely stepped up for the website refactoring and preparing for the 1.11.1 release!
+
+Please join me in welcoming Martin to the Avro PMC!
